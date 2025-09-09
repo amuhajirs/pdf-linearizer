@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Multi PDF Linearizer</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container">
+    <h1>Linearize Multiple PDFs</h1>
+    <form action="/linearize" method="post" enctype="multipart/form-data">
+        <input type="file" name="files" accept="application/pdf" multiple required>
+        <button type="submit">Upload & Convert All</button>
+    </form>
+</div>
+</body>
+</html>

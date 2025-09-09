@@ -4,12 +4,13 @@
 A simple tool web based app for linearize pdf. This project using QPDF for linearize pdf file, and it not support for windows. If you want to run this project in windows, please use WSL instead.
 ## Features
 
-#### API
 - Linearize multiple pdf files
+
 ## Tech Stack
 
 - QPDF
 - Golang
+
 ## Run Locally
 
 As I said before, This project using QPDF for linearize pdf file, and it not support for windows. If you want to run this project in windows, please use WSL instead.

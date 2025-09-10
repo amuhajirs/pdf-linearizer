@@ -118,7 +118,7 @@ func main() {
 			return
 		}
 
-		fmt.Printf("Processing %d file(s)\\n", len(files))
+		fmt.Printf("Processing %d file(s)\n", len(files))
 
 		// === CASE: SINGLE FILE ===
 		if len(files) == 1 {
@@ -128,6 +128,7 @@ func main() {
 
 			if err := linearizeToWriter(file, c.Writer); err != nil {
 				log.Printf("ERROR linearize: %v", err)
+				// Write plain text error (note: headers already set to pdf, but this is best-effort)
 				c.String(http.StatusInternalServerError, "Linearize failed: %v", err)
 				return
 			}
@@ -137,6 +138,7 @@ func main() {
 		// === CASE: MULTI FILE (ZIP) ===
 		c.Header("Content-Disposition", "attachment; filename=linearized_files.zip")
 		c.Header("Content-Type", "application/zip")
+		c.Header("Transfer-Encoding", "chunked")
 
 		// Channel for jobs and results
 		jobs := make(chan job, len(files))
@@ -149,12 +151,12 @@ func main() {
 		// Start workers
 		for w := 0; w < workerCount; w++ {
 			wg.Add(1)
-			fmt.Printf("Worker %d started\\n", w)
+			fmt.Printf("Worker %d started\n", w)
 			go func(workerID int) {
 				defer wg.Done()
-				fmt.Printf("Worker %d running\\n", workerID)
+				fmt.Printf("Worker %d running\n", workerID)
 				for j := range jobs {
-					fmt.Printf("Worker %d: processing %s\\n", workerID, j.file.Filename)
+					fmt.Printf("Worker %d: processing %s\n", workerID, j.file.Filename)
 					tempPath, err := linearizeToTempFile(j.file)
 					results <- result{
 						filename: j.file.Filename,
@@ -162,9 +164,9 @@ func main() {
 						err:      err,
 					}
 					if err != nil {
-						fmt.Printf("Worker %d: ERROR %s - %v\\n", workerID, j.file.Filename, err)
+						fmt.Printf("Worker %d: ERROR %s - %v\n", workerID, j.file.Filename, err)
 					} else {
-						fmt.Printf("Worker %d: SUCCESS %s -> %s\\n", workerID, j.file.Filename, tempPath)
+						fmt.Printf("Worker %d: SUCCESS %s -> %s\n", workerID, j.file.Filename, tempPath)
 					}
 				}
 			}(w)
@@ -175,16 +177,26 @@ func main() {
 			jobs <- job{file: f}
 		}
 		close(jobs)
-		fmt.Printf("All jobs have been sent to the queue\\n")
+		fmt.Printf("All jobs have been sent to the queue\n")
 
-		// Closer: close results channel after all workers are done
-		wg.Wait()
-		close(results)
-		fmt.Printf("All workers finished, results channel closed\\n")
+		// Closer goroutine: close results channel after all workers are done
+		go func() {
+			wg.Wait()
+			close(results)
+			fmt.Printf("All workers finished, results channel closed\n")
+		}()
 
-		// === SEQUENTIAL ZIP CREATION STAGE ===
+		// === SEQUENTIAL ZIP CREATION STAGE (streaming) ===
 		zipWriter := zip.NewWriter(c.Writer)
-		defer zipWriter.Close()
+		// Ensure zip central directory is written before returning
+		defer func() {
+			if err := zipWriter.Close(); err != nil {
+				log.Printf("zipWriter.Close error: %v", err)
+			}
+		}()
+
+		// Try to get flusher
+		flusher, flushOK := c.Writer.(http.Flusher)
 
 		// Slice to store temp files that need to be cleaned up
 		var tempFilesToCleanup []string
@@ -200,8 +212,7 @@ func main() {
 		successCount := 0
 		totalFiles := len(files)
 
-		// Process all results from workers
-		fmt.Printf("Results: %v\\n", len(results))
+		// Process all results from workers as they arrive
 		for res := range results {
 			fmt.Println("Reading worker result:", res.filename)
 
@@ -246,11 +257,20 @@ func main() {
 				continue
 			}
 
-			fmt.Printf("✓ %s successfully added to ZIP (%d bytes)\\n", res.filename, written)
+			// Flush the response so browser starts receiving bytes immediately
+			if flushOK {
+				flusher.Flush()
+				fmt.Printf("Flushed after adding %s (%d bytes)\n", res.filename, written)
+			} else {
+				fmt.Printf("Added %s (%d bytes) - flusher not available\n", res.filename, written)
+			}
+
+			fmt.Printf("✓ %s successfully added to ZIP (%d bytes)\n", res.filename, written)
 			successCount++
 		}
 
-		fmt.Printf("ZIP creation finished: %d/%d files successful\\n", successCount, totalFiles)
+		// After results loop ends, zipWriter.Close() will be called by deferred function above.
+		fmt.Printf("ZIP creation finished: %d/%d files successful\n", successCount, totalFiles)
 	})
 
 	r.Run(":8080")

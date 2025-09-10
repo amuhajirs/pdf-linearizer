@@ -2,7 +2,6 @@ package main
 
 import (
 	"archive/zip"
-	"bytes"
 	"fmt"
 	"html/template"
 	"io"
@@ -16,58 +15,82 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func linearizeToWriter(f *multipart.FileHeader, writer io.Writer) error {
-    // Simpan upload ke file sementara (sebagai input qpdf)
-    tempInput, err := os.CreateTemp("", "input-*.pdf")
-    if err != nil {
-        return fmt.Errorf("temp input: %w", err)
-    }
-    defer os.Remove(tempInput.Name())
-    defer tempInput.Close()
+func linearizeToWriter(f *multipart.FileHeader, w io.Writer) error {
+	tempInput, err := os.CreateTemp("", "input-*.pdf")
+	if err != nil {
+		return fmt.Errorf("create temp input: %w", err)
+	}
+	defer os.Remove(tempInput.Name())
+	defer tempInput.Close()
 
-    src, err := f.Open()
-    if err != nil {
-        return fmt.Errorf("open upload: %w", err)
-    }
-    if _, err := io.Copy(tempInput, src); err != nil {
-        return fmt.Errorf("copy upload: %w", err)
-    }
-    src.Close()
+	src, err := f.Open()
+	if err != nil {
+		return fmt.Errorf("open upload: %w", err)
+	}
+	if _, err := io.Copy(tempInput, src); err != nil {
+		return fmt.Errorf("copy upload: %w", err)
+	}
+	src.Close()
 
-    // qpdf input= temp file, output= stdout
-    cmd := exec.Command("qpdf", "--linearize", tempInput.Name(), "-")
+	cmd := exec.Command("qpdf", "--linearize", tempInput.Name(), "-")
+	cmd.Stdout = w
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
 
-    stdout, err := cmd.StdoutPipe()
-    if err != nil {
-        return fmt.Errorf("stdout pipe: %w", err)
-    }
-    stderr, err := cmd.StderrPipe()
-    if err != nil {
-        return fmt.Errorf("stderr pipe: %w", err)
-    }
+// linearizeToTempFile: run qpdf and save the result to a temp file
+func linearizeToTempFile(f *multipart.FileHeader) (string, error) {
+	// save input to temp file
+	tempInput, err := os.CreateTemp("", "input-*.pdf")
+	if err != nil {
+		return "", fmt.Errorf("create temp input: %w", err)
+	}
+	defer os.Remove(tempInput.Name())
+	defer tempInput.Close()
 
-    if err := cmd.Start(); err != nil {
-        return fmt.Errorf("qpdf start: %w", err)
-    }
+	src, err := f.Open()
+	if err != nil {
+		return "", fmt.Errorf("open upload: %w", err)
+	}
+	if _, err := io.Copy(tempInput, src); err != nil {
+		return "", fmt.Errorf("copy upload: %w", err)
+	}
+	src.Close()
 
-    // capture stderr
-    var stderrBuf bytes.Buffer
-    go io.Copy(&stderrBuf, stderr)
+	// output temp
+	tempOutput, err := os.CreateTemp("", "output-*.pdf")
+	if err != nil {
+		return "", fmt.Errorf("create temp output: %w", err)
+	}
+	tempOutput.Close()
 
-    // stream hasil langsung ke writer (bisa ke response atau zip entry)
-    if _, err := io.Copy(writer, stdout); err != nil {
-        return fmt.Errorf("stream copy error: %w", err)
-    }
+	// run qpdf
+	cmd := exec.Command("qpdf", "--linearize", tempInput.Name(), tempOutput.Name())
+	out, err := cmd.CombinedOutput()
 
-    if err := cmd.Wait(); err != nil {
-        return fmt.Errorf("qpdf failed: %w\nStderr:\n%s", err, stderrBuf.String())
-    }
+	// check if the resulting file actually exists & has content
+	info, statErr := os.Stat(tempOutput.Name())
+	if statErr != nil || info.Size() == 0 {
+		os.Remove(tempOutput.Name())
+		return "", fmt.Errorf("qpdf failed completely: %w, stderr: %s", err, string(out))
+	}
 
-    if stderrBuf.Len() > 0 {
-        log.Printf("qpdf warnings: %s", stderrBuf.String())
-    }
+	// if qpdf returns exit code != 0 but the file is created -> just a warning
+	if err != nil {
+		log.Printf("qpdf warning for %s: %s", f.Filename, string(out))
+	}
 
-    return nil
+	return tempOutput.Name(), nil
+}
+
+type job struct {
+	file *multipart.FileHeader
+}
+
+type result struct {
+	filename string
+	tempPath string
+	err      error
 }
 
 func main() {
@@ -85,15 +108,17 @@ func main() {
 	r.POST("/linearize", func(c *gin.Context) {
 		form, err := c.MultipartForm()
 		if err != nil {
-			c.String(http.StatusBadRequest, "Gagal membaca form")
+			c.String(http.StatusBadRequest, "Failed to read form")
 			return
 		}
 
 		files := form.File["files"]
 		if len(files) == 0 {
-			c.String(http.StatusBadRequest, "Tidak ada file yang diunggah")
+			c.String(http.StatusBadRequest, "No files uploaded")
 			return
 		}
+
+		fmt.Printf("Processing %d file(s)\\n", len(files))
 
 		// === CASE: SINGLE FILE ===
 		if len(files) == 1 {
@@ -102,8 +127,9 @@ func main() {
 			c.Header("Content-Type", "application/pdf")
 
 			if err := linearizeToWriter(file, c.Writer); err != nil {
-				fmt.Println("ERROR linearize:", err)
-				c.String(http.StatusInternalServerError, "Linearize gagal: %v", err)
+				log.Printf("ERROR linearize: %v", err)
+				c.String(http.StatusInternalServerError, "Linearize failed: %v", err)
+				return
 			}
 			return
 		}
@@ -112,36 +138,119 @@ func main() {
 		c.Header("Content-Disposition", "attachment; filename=linearized_files.zip")
 		c.Header("Content-Type", "application/zip")
 
-		zipWriter := zip.NewWriter(c.Writer)
+		// Channel for jobs and results
+		jobs := make(chan job, len(files))
+		results := make(chan result, len(files))
+
+		// Number of workers (adjustable)
+		workerCount := 3
 		var wg sync.WaitGroup
-		var mu sync.Mutex
 
-		// Worker pool limiter (misal 2 file paralel sekaligus)
-		sem := make(chan struct{}, 2)
-
-		for _, file := range files {
+		// Start workers
+		for w := 0; w < workerCount; w++ {
 			wg.Add(1)
-			go func(f *multipart.FileHeader) {
+			fmt.Printf("Worker %d started\\n", w)
+			go func(workerID int) {
 				defer wg.Done()
-				sem <- struct{}{} // masuk pool
-				defer func() { <-sem }()
-
-				// Buat entry zip
-				mu.Lock()
-				entry, _ := zipWriter.Create(f.Filename)
-				mu.Unlock()
-
-				// Linearize langsung ke entry
-				if err := linearizeToWriter(f, entry); err != nil {
-					fmt.Printf("Linearize %s gagal: %v\n", f.Filename, err)
-				} else {
-					fmt.Printf("Linearize %s selesai\n", f.Filename)
+				fmt.Printf("Worker %d running\\n", workerID)
+				for j := range jobs {
+					fmt.Printf("Worker %d: processing %s\\n", workerID, j.file.Filename)
+					tempPath, err := linearizeToTempFile(j.file)
+					results <- result{
+						filename: j.file.Filename,
+						tempPath: tempPath,
+						err:      err,
+					}
+					if err != nil {
+						fmt.Printf("Worker %d: ERROR %s - %v\\n", workerID, j.file.Filename, err)
+					} else {
+						fmt.Printf("Worker %d: SUCCESS %s -> %s\\n", workerID, j.file.Filename, tempPath)
+					}
 				}
-			}(file)
+			}(w)
 		}
 
+		// Producer: send all jobs
+		for _, f := range files {
+			jobs <- job{file: f}
+		}
+		close(jobs)
+		fmt.Printf("All jobs have been sent to the queue\\n")
+
+		// Closer: close results channel after all workers are done
 		wg.Wait()
-		zipWriter.Close()
+		close(results)
+		fmt.Printf("All workers finished, results channel closed\\n")
+
+		// === SEQUENTIAL ZIP CREATION STAGE ===
+		zipWriter := zip.NewWriter(c.Writer)
+		defer zipWriter.Close()
+
+		// Slice to store temp files that need to be cleaned up
+		var tempFilesToCleanup []string
+		defer func() {
+			// Cleanup all temp files
+			for _, tempPath := range tempFilesToCleanup {
+				if tempPath != "" {
+					os.Remove(tempPath)
+				}
+			}
+		}()
+
+		successCount := 0
+		totalFiles := len(files)
+
+		// Process all results from workers
+		fmt.Printf("Results: %v\\n", len(results))
+		for res := range results {
+			fmt.Println("Reading worker result:", res.filename)
+
+			if res.err != nil {
+				log.Printf("Linearize %s failed: %v", res.filename, res.err)
+				continue
+			}
+
+			// Add to cleanup list
+			tempFilesToCleanup = append(tempFilesToCleanup, res.tempPath)
+
+			// Check if temp file exists and is not empty
+			fileInfo, err := os.Stat(res.tempPath)
+			if err != nil {
+				log.Printf("Temp file %s not found: %v", res.tempPath, err)
+				continue
+			}
+			if fileInfo.Size() == 0 {
+				log.Printf("Temp file %s is empty", res.tempPath)
+				continue
+			}
+
+			// Create entry in ZIP
+			entry, err := zipWriter.Create(res.filename)
+			if err != nil {
+				log.Printf("Failed to create ZIP entry for %s: %v", res.filename, err)
+				continue
+			}
+
+			// Read and copy temp file to ZIP entry
+			tempFile, err := os.Open(res.tempPath)
+			if err != nil {
+				log.Printf("Failed to open temp file %s: %v", res.tempPath, err)
+				continue
+			}
+
+			written, err := io.Copy(entry, tempFile)
+			tempFile.Close()
+
+			if err != nil {
+				log.Printf("Failed to copy data to ZIP for %s: %v", res.filename, err)
+				continue
+			}
+
+			fmt.Printf("✓ %s successfully added to ZIP (%d bytes)\\n", res.filename, written)
+			successCount++
+		}
+
+		fmt.Printf("ZIP creation finished: %d/%d files successful\\n", successCount, totalFiles)
 	})
 
 	r.Run(":8080")
